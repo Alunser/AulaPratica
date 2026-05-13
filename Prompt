@@ -1,40 +1,80 @@
-Precisamos refatorar o handler de processamento de movimentos contábeis. O fluxo atual está com responsabilidades misturadas e está causando publicações com campos nulos/vazios.
+CORREÇÃO — Try/Catch dentro do Parallel.ForEachAsync
 
-O que precisa ser feito:
+PROBLEMA IDENTIFICADO:
+O try/catch foi removido de dentro do Parallel.ForEachAsync na refatoração.
+Isso causa perda permanente de retornos quando qualquer mensagem do lote
+estoura uma exceção transiente (timeout, banco fora, etc.).
 
-1. O método ProcessarMensagemIndividual deve ter responsabilidade única: executar todas as validações e ao final retornar um objeto de retorno já preenchido (sucesso ou erro). Ele não deve publicar nem fazer commit.
+CENÁRIO DO PROBLEMA:
+1. Mensagem A e B são processadas em paralelo — gravadas no banco com sucesso
+2. Mensagem C estoura exceção (ex: timeout no banco)
+3. O Parallel.ForEachAsync propaga a exceção para fora
+4. O handler nunca chega no PublicarRetornos nem no Commit
+5. Kafka reenvia o lote inteiro
+6. A e B são detectadas como duplicata (INSERT IGNORE) — return null
+7. Os retornos de A e B são perdidos permanentemente
+8. O sistema downstream nunca é notificado sobre esses registros
 
-2. Criar um único método de gravação/retorno que receba o movimento, um flag de sucesso e uma mensagem de erro opcional. Se sucesso → grava na tabela de movimentos e monta retorno 200. Se erro → grava na tabela de erros e monta retorno 422. Sem duplicação de lógica.
+O QUE PRECISA SER FEITO:
+Recolocar o try/catch DENTRO do Parallel.ForEachAsync para capturar
+erros transientes individualmente, sem cancelar o lote inteiro.
 
-3. O Handle deve continuar usando Parallel.ForEachAsync para garantir a performance atual. Ele coleta todos os retornos gerados, publica o lote inteiro de uma vez e só então faz o commit. Se a publicação falhar, não faz commit e o Kafka reenvia.
+CÓDIGO CORRETO:
 
-4. Casos de duplicata (mensagem já processada) e mapeamento nulo devem ser ignorados silenciosamente — sem gravar e sem publicar retorno.
+int falhasTransientes = 0;
 
-REGRA CRÍTICA — COMMIT vs REENVIO KAFKA:
+await Parallel.ForEachAsync(
+    mensagens,
+    new ParallelOptions
+    {
+        MaxDegreeOfParallelism = _workerConfiguration.MaxParallelismo,
+        CancellationToken      = cancellationToken
+    },
+    async (mensagem, ct) =>
+    {
+        try
+        {
+            var retorno = await ProcessarMensagemIndividual(mensagem);
+            if (retorno is not null)
+                retornos.Add(retorno);
+        }
+        catch (Exception ex)
+        {
+            // Erro TRANSIENTE — incrementa contador mas não cancela o lote
+            // Essa mensagem voltará pelo Kafka no próximo ciclo
+            // As demais mensagens do lote continuam sendo processadas normalmente
+            Interlocked.Increment(ref falhasTransientes);
+            _logger.LogWarning(ex,
+                "Erro transiente ao processar mensagem. Kafka reenviará.");
+        }
+    });
 
-Existem DOIS tipos de falha com comportamentos completamente diferentes:
+// Se teve falha transiente — não faz commit
+// As mensagens com erro voltam pelo Kafka
+// As que já foram gravadas com sucesso viram duplicata no próximo lote (INSERT IGNORE)
+if (falhasTransientes > 0)
+{
+    _logger.LogWarning(
+        "Commit não realizado. {Count} falhas transientes no lote. Kafka reenviará.",
+        falhasTransientes);
+    return new CommandResult((int)HttpStatusCode.OK);
+}
 
-1. ERRO DE NEGÓCIO (validação, empresa inválida, evento não encontrado...)
-   → A mensagem FOI processada, só que com resultado negativo.
-   → Grava na tabela de erros + publica retorno 422.
-   → Commit DEVE acontecer normalmente após a publicação.
-   → NÃO deve voltar pro Kafka.
-   ⚠️ Se voltar pro Kafka vai falhar eternamente — LOOP INFINITO.
+REGRAS QUE NÃO MUDAM:
+- Erro de NEGÓCIO (validação, empresa inválida, evento não encontrado)
+  → Tratado dentro de ProcessarMensagemIndividual
+  → Retorna retorno 422 — nunca estoura exceção
+  → Commit acontece normalmente
 
-2. ERRO TRANSIENTE (exceção inesperada, banco fora, timeout, falha na publicação)
-   → A mensagem NÃO foi processada. Algo inesperado quebrou no meio.
-   → NÃO faz commit. O Kafka reenvia o lote automaticamente.
-   → Correto — o problema pode se resolver sozinho.
+- Erro TRANSIENTE (exceção, banco fora, timeout)
+  → Capturado pelo try/catch dentro do Parallel
+  → Incrementa falhasTransientes
+  → Não faz commit — Kafka reenvia
 
-RESUMO:
-Erro de negócio      → commit ✅    (mensagem tratada, mesmo que com erro)
-Erro transiente      → sem commit ✅ (Kafka reenvia)
-Falha na publicação  → sem commit ✅ (Kafka reenvia o lote inteiro)
+- Falha na publicação
+  → Não faz commit — Kafka reenvia o lote inteiro
 
-⚠️ NUNCA bloqueie o commit por causa de erro de validação/negócio.
-
-O paralelismo deve ser mantido pois o volume consumido do Kafka é alto.
-A mudança é só de organização do código, não da estratégia de execução.
-
-O esqueleto completo com comentários está no arquivo .cs anexo.
+⚠️ NUNCA remover o try/catch de dentro do Parallel.ForEachAsync.
+   Sem ele, erros transientes em UMA mensagem causam perda de retornos
+   de TODAS as outras mensagens já processadas no mesmo lote.
 
