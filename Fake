@@ -1,0 +1,158 @@
+// ============================================================
+//  MassaFakeMovimentoContabil — Massa de teste
+//  Use para debugar o handler sem depender do Kafka.
+//
+//  COMO USAR:
+//  No lugar de consumir do Kafka, chame:
+//  var mensagens = MassaFakeMovimentoContabil.GerarLoteMisto();
+//
+//  Cobre todos os caminhos do fluxo:
+//  ✅ Sucesso
+//  ❌ Campo obrigatório nulo
+//  ❌ Empresa inválida
+//  ❌ Evento de negócio inválido
+//  🔁 Duplicata (mesmo ID de um sucesso)
+// ============================================================
+
+public static class MassaFakeMovimentoContabil
+{
+    // ID fixo usado para simular duplicata
+    private static readonly string IdDuplicata = "FIN-0001-DUPLICATA";
+
+    // =========================================================
+    //  LOTE MISTO — cobre todos os cenários de uma vez
+    // =========================================================
+    public static List<RecebimentoMovimentoContabilCommandResult> GerarLoteMisto()
+    {
+        return new List<RecebimentoMovimentoContabilCommandResult>
+        {
+            GerarSucesso(),                  // ✅ caminho feliz
+            GerarSucesso(),                  // ✅ caminho feliz (segundo registro)
+            GerarDuplicata(),                // 🔁 mesmo ID do GerarSucesso com IdDuplicata
+            GerarSucessoComIdDuplicata(),    // ✅ primeiro registro com IdDuplicata (será gravado)
+            GerarCampoFinanceiroNulo(),      // ❌ CodigoIdentificacaoMovimentacaoFinanceira nulo
+            GerarEmpresaInvalida(),          // ❌ CodigoEmpresa que não existe
+            GerarEventoNegocioInvalido(),    // ❌ IdentificadorEventoNegocio que não existe
+            GerarCampoEmpresaNulo(),         // ❌ CodigoEmpresa nulo
+        };
+    }
+
+    // =========================================================
+    //  ✅ SUCESSO — todos os campos válidos
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarSucesso(
+        string idFinanceiro = null) =>
+        new(200)
+        {
+            CodigoIdentificacaoMovimentacaoFinanceira = idFinanceiro ?? Guid.NewGuid().ToString(),
+            CodigoPessoaCorporativo                  = "PES123456",
+            CodigoTipoPessoaTitularRecebivel         = "F",
+            NumeroCentroCustoDebito                  = "CC001",
+            NumeroCentroCustoCredito                 = "CC002",
+            CodigoIdentificadorReferenciaMovimento   = Guid.NewGuid().ToString(),
+            CodigoProdutoOperacional                 = 1,
+            IdentificadorEventoNegocio               = 100,   // ⚠️ use um ID válido no seu ambiente
+            CodigoEmpresa                            = 1,     // ⚠️ use um código válido no seu ambiente
+            IdentificadorGrupo                       = 10,
+            NumeroIdentificadorCotaCliente           = 5,
+            NumeroGrupoBemProdutoConsorcio           = "GRP001",
+            NumeroCotaConsorcio                      = 1,
+            NumeroSequencialVersao                   = 1,
+            NumeroContrato                           = 123456,
+            DataHoraVenda                            = DateTime.Now.AddDays(-1),
+            DataContemplacao ConsorcioConsorcio       = DateTime.Now.AddDays(-1).ToString("yyyy-MM-dd"),
+            DataEntregaBemConsorcio                  = DateTime.Now.ToString("yyyy-MM-dd"),
+            CodigoSituacaoCobranca                   = "A",
+            DataCancelamentoCota                     = null,
+            CodigoSituacaoGrupo                      = "A",
+            CodigoTipoEmpresaOrigem                  = "M",
+            CodigoEmpresaOrigem                      = "EMP001",
+            CodigoDependenciaOrigem                  = "DEP001",
+            CodigoTipoEmpresaDestino                 = "M",
+            CodigoEmpresaDestino                     = "EMP002",
+            CodigoDependenciaDestino                 = "DEP002",
+            IndicadorStatusExterno                   = "A",
+            SiglaSistemaEvento                       = "SIS01",
+            NumeroParcelaContrato                    = 1,
+            NumeroPrazoCota                          = 60,
+            DataVencimentoParcelaContrato            = DateTime.Now.AddMonths(1).ToString("yyyy-MM-dd"),
+            DataContabilTransacao                    = DateTime.Now.ToString("yyyy-MM-dd"),
+            IndicadorTributacaoImposto               = "S",
+            ValorContratoAdesao                      = 10000.00,
+            ValorFundoComum                          = 8000.00,
+            ValorFundoReserva                        = 500.00,
+            ValorTaxaAdministracaoPaga               = 300.00,
+            ValorSeguroPagar                         = 100.00,
+            ValorMultaJuroPagar                      = 0,
+            ValorMultaJuroAdministradora             = 0,
+            ValorOutro                               = 0,
+            ValorTotalGrupo                          = 9000.00,
+            ValorTotalDemaisParcela                  = 1000.00,
+            ValorTotalLancamento                     = 10000.00,
+            ValorTotalTributacao                     = 150.00,
+            IndicadorTarifaMovimento                 = "N",
+            DataOperacaoOrigem                       = DateTime.Now.ToString("yyyy-MM-dd"),
+            CodigoTipoMotivoExterno                  = "MOT01",
+            CodigoUnicoTransacaoOrigem               = Guid.NewGuid().ToString(),
+            CodigoSistemaIntegrador                  = "SIS_INT",
+            IndicadorGrupoAntesLei                   = "N"
+        };
+
+    // =========================================================
+    //  🔁 DUPLICATA — mesmo ID financeiro de GerarSucessoComIdDuplicata
+    //  Deve ser ignorado silenciosamente (sem gravar, sem publicar)
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarDuplicata() =>
+        GerarSucesso(IdDuplicata);
+
+    public static RecebimentoMovimentoContabilCommandResult GerarSucessoComIdDuplicata() =>
+        GerarSucesso(IdDuplicata);
+
+    // =========================================================
+    //  ❌ CAMPO FINANCEIRO NULO
+    //  CodigoIdentificacaoMovimentacaoFinanceira = null
+    //  Esperado: grava erro + publica retorno 422 + commit normal
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarCampoFinanceiroNulo()
+    {
+        var fake = GerarSucesso();
+        fake.CodigoIdentificacaoMovimentacaoFinanceira = null;
+        return fake;
+    }
+
+    // =========================================================
+    //  ❌ EMPRESA NULA
+    //  CodigoEmpresa = 0 (ou valor que não existe)
+    //  Esperado: grava erro + publica retorno 422 + commit normal
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarCampoEmpresaNulo()
+    {
+        var fake = GerarSucesso();
+        fake.CodigoEmpresa = 0;
+        return fake;
+    }
+
+    // =========================================================
+    //  ❌ EMPRESA INVÁLIDA
+    //  CodigoEmpresa com valor que não existe no banco
+    //  Esperado: grava erro + publica retorno 422 + commit normal
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarEmpresaInvalida()
+    {
+        var fake = GerarSucesso();
+        fake.CodigoEmpresa = 99999; // ⚠️ use um código que não existe no seu ambiente
+        return fake;
+    }
+
+    // =========================================================
+    //  ❌ EVENTO DE NEGÓCIO INVÁLIDO
+    //  IdentificadorEventoNegocio com valor que não existe no banco
+    //  Esperado: grava erro + publica retorno 422 + commit normal
+    // =========================================================
+    public static RecebimentoMovimentoContabilCommandResult GerarEventoNegocioInvalido()
+    {
+        var fake = GerarSucesso();
+        fake.IdentificadorEventoNegocio = 99999; // ⚠️ use um ID que não existe no seu ambiente
+        return fake;
+    }
+}
