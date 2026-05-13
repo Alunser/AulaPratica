@@ -1,0 +1,40 @@
+Precisamos refatorar o handler de processamento de movimentos contábeis. O fluxo atual está com responsabilidades misturadas e está causando publicações com campos nulos/vazios.
+
+O que precisa ser feito:
+
+1. O método ProcessarMensagemIndividual deve ter responsabilidade única: executar todas as validações e ao final retornar um objeto de retorno já preenchido (sucesso ou erro). Ele não deve publicar nem fazer commit.
+
+2. Criar um único método de gravação/retorno que receba o movimento, um flag de sucesso e uma mensagem de erro opcional. Se sucesso → grava na tabela de movimentos e monta retorno 200. Se erro → grava na tabela de erros e monta retorno 422. Sem duplicação de lógica.
+
+3. O Handle deve continuar usando Parallel.ForEachAsync para garantir a performance atual. Ele coleta todos os retornos gerados, publica o lote inteiro de uma vez e só então faz o commit. Se a publicação falhar, não faz commit e o Kafka reenvia.
+
+4. Casos de duplicata (mensagem já processada) e mapeamento nulo devem ser ignorados silenciosamente — sem gravar e sem publicar retorno.
+
+REGRA CRÍTICA — COMMIT vs REENVIO KAFKA:
+
+Existem DOIS tipos de falha com comportamentos completamente diferentes:
+
+1. ERRO DE NEGÓCIO (validação, empresa inválida, evento não encontrado...)
+   → A mensagem FOI processada, só que com resultado negativo.
+   → Grava na tabela de erros + publica retorno 422.
+   → Commit DEVE acontecer normalmente após a publicação.
+   → NÃO deve voltar pro Kafka.
+   ⚠️ Se voltar pro Kafka vai falhar eternamente — LOOP INFINITO.
+
+2. ERRO TRANSIENTE (exceção inesperada, banco fora, timeout, falha na publicação)
+   → A mensagem NÃO foi processada. Algo inesperado quebrou no meio.
+   → NÃO faz commit. O Kafka reenvia o lote automaticamente.
+   → Correto — o problema pode se resolver sozinho.
+
+RESUMO:
+Erro de negócio      → commit ✅    (mensagem tratada, mesmo que com erro)
+Erro transiente      → sem commit ✅ (Kafka reenvia)
+Falha na publicação  → sem commit ✅ (Kafka reenvia o lote inteiro)
+
+⚠️ NUNCA bloqueie o commit por causa de erro de validação/negócio.
+
+O paralelismo deve ser mantido pois o volume consumido do Kafka é alto.
+A mudança é só de organização do código, não da estratégia de execução.
+
+O esqueleto completo com comentários está no arquivo .cs anexo.
+
