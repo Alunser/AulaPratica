@@ -1,80 +1,29 @@
-CORREÇÃO — Try/Catch dentro do Parallel.ForEachAsync
+CORREÇÃO — DapperContext não é thread-safe
+O problema está no DapperContext, linha do ??=. No paralelo várias threads acessam ao mesmo tempo, todas veem null e todas tentam atribuir — estoura o erro.
+Troca isso:
 
-PROBLEMA IDENTIFICADO:
-O try/catch foi removido de dentro do Parallel.ForEachAsync na refatoração.
-Isso causa perda permanente de retornos quando qualquer mensagem do lote
-estoura uma exceção transiente (timeout, banco fora, etc.).
+private string? _cachedConnectionString;
 
-CENÁRIO DO PROBLEMA:
-1. Mensagem A e B são processadas em paralelo — gravadas no banco com sucesso
-2. Mensagem C estoura exceção (ex: timeout no banco)
-3. O Parallel.ForEachAsync propaga a exceção para fora
-4. O handler nunca chega no PublicarRetornos nem no Commit
-5. Kafka reenvia o lote inteiro
-6. A e B são detectadas como duplicata (INSERT IGNORE) — return null
-7. Os retornos de A e B são perdidos permanentemente
-8. O sistema downstream nunca é notificado sobre esses registros
-
-O QUE PRECISA SER FEITO:
-Recolocar o try/catch DENTRO do Parallel.ForEachAsync para capturar
-erros transientes individualmente, sem cancelar o lote inteiro.
-
-CÓDIGO CORRETO:
-
-int falhasTransientes = 0;
-
-await Parallel.ForEachAsync(
-    mensagens,
-    new ParallelOptions
-    {
-        MaxDegreeOfParallelism = _workerConfiguration.MaxParallelismo,
-        CancellationToken      = cancellationToken
-    },
-    async (mensagem, ct) =>
-    {
-        try
-        {
-            var retorno = await ProcessarMensagemIndividual(mensagem);
-            if (retorno is not null)
-                retornos.Add(retorno);
-        }
-        catch (Exception ex)
-        {
-            // Erro TRANSIENTE — incrementa contador mas não cancela o lote
-            // Essa mensagem voltará pelo Kafka no próximo ciclo
-            // As demais mensagens do lote continuam sendo processadas normalmente
-            Interlocked.Increment(ref falhasTransientes);
-            _logger.LogWarning(ex,
-                "Erro transiente ao processar mensagem. Kafka reenviará.");
-        }
-    });
-
-// Se teve falha transiente — não faz commit
-// As mensagens com erro voltam pelo Kafka
-// As que já foram gravadas com sucesso viram duplicata no próximo lote (INSERT IGNORE)
-if (falhasTransientes > 0)
+public IDbConnection CreateConnection()
 {
-    _logger.LogWarning(
-        "Commit não realizado. {Count} falhas transientes no lote. Kafka reenviará.",
-        falhasTransientes);
-    return new CommandResult((int)HttpStatusCode.OK);
+    _cachedConnectionString ??= BuildConnectionString();
+    return new MySqlConnection(_cachedConnectionString);
 }
 
-REGRAS QUE NÃO MUDAM:
-- Erro de NEGÓCIO (validação, empresa inválida, evento não encontrado)
-  → Tratado dentro de ProcessarMensagemIndividual
-  → Retorna retorno 422 — nunca estoura exceção
-  → Commit acontece normalmente
 
-- Erro TRANSIENTE (exceção, banco fora, timeout)
-  → Capturado pelo try/catch dentro do Parallel
-  → Incrementa falhasTransientes
-  → Não faz commit — Kafka reenvia
+Por isso:
+private readonly Lazy<string> _cachedConnectionString;
 
-- Falha na publicação
-  → Não faz commit — Kafka reenvia o lote inteiro
+public DapperContext(RdsConfiguration rdsConfiguration)
+{
+    _rdsConfiguration = rdsConfiguration;
+    _cachedConnectionString = new Lazy<string>(BuildConnectionString);
+}
 
-⚠️ NUNCA remover o try/catch de dentro do Parallel.ForEachAsync.
-   Sem ele, erros transientes em UMA mensagem causam perda de retornos
-   de TODAS as outras mensagens já processadas no mesmo lote.
+public IDbConnection CreateConnection()
+{
+    return new MySqlConnection(_cachedConnectionString.Value);
+}
 
+
+Lazy<string> é thread-safe por natureza — garante que BuildConnectionString é chamado uma única vez mesmo com várias threads. Depois dessa correção pode voltar o Singleton no Bootstrap também.
