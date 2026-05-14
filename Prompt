@@ -1,29 +1,129 @@
-CORREÇÃO — DapperContext não é thread-safe
-O problema está no DapperContext, linha do ??=. No paralelo várias threads acessam ao mesmo tempo, todas veem null e todas tentam atribuir — estoura o erro.
-Troca isso:
+Contexto:
+Temos uma Lambda SQS que processa registros em lote, controla um contador no Redis e dispara o EventBridge quando o lote completa.
+Problema 1 — Race condition:
+Múltiplas instâncias da Lambda podem disparar o EventBridge ao mesmo tempo porque o INCR e a verificação do contador não são atômicos.
+Problema 2 — Lotes travados:
+Registros que falham com FK error no MySQL não incrementam o contador do Redis, fazendo o lote nunca completar e o EventBridge nunca disparar.
 
-private string? _cachedConnectionString;
+O que precisa ajustar:
+1. Criar método no redis_service.py:
+increment_and_check_completion(lote, total) -> bool
+Usar Lua script para fazer INCR + verificação atomicamente.
+Retornar True apenas para o worker que fizer o contador bater o total.
 
-public IDbConnection CreateConnection()
-{
-    _cachedConnectionString ??= BuildConnectionString();
-    return new MySqlConnection(_cachedConnectionString);
-}
+2. No sqs_batch_handler.py:
+Após o loop de records, pegar a quantidade de batch_item_failures
+e incrementar o contador do Redis por essa quantidade também,
+pois erros de FK são aceitos e não devem travar o lote.
+Substituir a condição atual pelo novo método atômico.
 
+3. No record_processor.py:
+Remover o increment_lote_idempotent do process().
+Ele passa a ser responsabilidade do sqs_batch_handler.
 
-Por isso:
-private readonly Lazy<string> _cachedConnectionString;
+def increment_lote_by(self, lote: str, quantidade: int) -> int:
+    """Incrementa o contador do lote por uma quantidade específica."""
+    try:
+        result = RedisClusterClient.incrby(lote, quantidade)
+        logger.info(f"Contador do lote {lote} incrementado por {quantidade}. Novo valor: {result}")
+        return result
+    except Exception:
+        logger.error(f"Falha ao incrementar lote {lote} por {quantidade}")
+        raise
 
-public DapperContext(RdsConfiguration rdsConfiguration)
-{
-    _rdsConfiguration = rdsConfiguration;
-    _cachedConnectionString = new Lazy<string>(BuildConnectionString);
-}
+def increment_and_check_completion(self, lote: str, total: int) -> bool:
+    """
+    Incrementa contador e verifica se bateu o total de forma ATÔMICA via Lua.
+    Garante que apenas UM worker dispare o EventBridge.
+    Retorna True apenas para o worker que fizer o contador bater o total.
+    """
+    lua_script = """
+    local current = redis.call('INCR', KEYS[1])
+    if tonumber(current) == tonumber(ARGV[1]) then
+        return 1
+    end
+    return 0
+    """
+    try:
+        result = RedisClusterClient.eval(lua_script, 1, lote, total)
+        logger.info(f"Lote {lote}: contador atual após INCR atômico, total esperado {total}")
+        return result == 1
+    except Exception:
+        logger.error(f"Falha no increment_and_check_completion para lote {lote}")
+        raise
 
-public IDbConnection CreateConnection()
-{
-    return new MySqlConnection(_cachedConnectionString.Value);
-}
+def process(self, record: Dict[str, Any]) -> ProcessResult:
+    """Processa registro SQS com idempotencia via Redis SETNX."""
+    message = json.loads(record['body'])
+    Validator.validar_mensagem(message)
+    mensagem_dto = MensagemDto.from_dict(message)
 
+    mensagem_dto = self._enrich_with_cliente(mensagem_dto)
+    self.rds_service.save(mensagem_dto)
 
-Lazy<string> é thread-safe por natureza — garante que BuildConnectionString é chamado uma única vez mesmo com várias threads. Depois dessa correção pode voltar o Singleton no Bootstrap também.
+    # REMOVIDO: increment_lote_idempotent daqui
+    # Agora é responsabilidade do sqs_batch_handler
+
+    return ProcessResult(
+        lote=mensagem_dto.lote,
+        data_batch=mensagem_dto.data_batch,
+        contador_atual=0,  # não usado mais aqui
+        total_registros=int(mensagem_dto.total_registros),
+        was_new_item=True,
+        identificador_evento=mensagem_dto.identificador_evento
+    )
+
+def handle_sqs_batch(event: Dict[str, Any], context: Any) -> Dict[str, List[Dict[str, str]]]:
+    start_time = time.time()
+    records = event.get('Records', [])
+    logger.info(f"Iniciando processamento de {len(records)} registros")
+
+    eventbridge_service = EventBridgeService()
+    processor = RecordProcessor()
+    batch_item_failures: List[Dict[str, str]] = []
+    result: Optional[ProcessResult] = None
+    fk_error_count = 0  # <-- contador de erros FK aceitos
+
+    try:
+        for record in records:
+            try:
+                result = processor.process(record)
+            except ForeignKeyConstraintError as e:
+                # Erro de FK é aceito — conta separado
+                message_id = record.get('messageId') or record.get('recordId')
+                logger.warning(f"FK error aceito para record {message_id}: {str(e)}")
+                fk_error_count += 1  # <-- incrementa FK errors
+            except Exception as e:
+                message_id = record.get('messageId') or record.get('recordId')
+                logger.error(f"Erro ao processar record {message_id or 'unknown'}: {str(e)}", exc_info=True)
+                if message_id:
+                    batch_item_failures.append({'itemIdentifier': message_id})
+
+        # Incrementa FK errors no contador (erros aceitos não devem travar o lote)
+        if result and fk_error_count > 0:
+            processor.redis_service.increment_lote_by(result.lote, fk_error_count)
+
+        # Verifica conclusão do lote de forma ATÔMICA
+        if result and result.total_registros > 0:
+            should_fire = processor.redis_service.increment_and_check_completion(
+                result.lote,
+                result.total_registros
+            )
+            if should_fire:
+                logger.info(f"Lote {result.lote} completo. Disparando EventBridge.")
+                _handle_batch_completion(processor, eventbridge_service, result)
+
+    finally:
+        processor.close()
+
+    elapsed = time.time() - start_time
+    success = len(records) - len(batch_item_failures) - fk_error_count
+    logger.info(f"Lambda finalizada em {elapsed:.2f}s. Sucesso: {success}/{len(records)}, FK errors aceitos: {fk_error_count}, Falhas: {len(batch_item_failures)}")
+
+    return {"batchItemFailures": batch_item_failures}
+
+ Observação importante para o Devin:
+
+O ForeignKeyConstraintError precisa ser uma exception customizada ou verificar a mensagem do erro MySQL. No rds_service.py já existe o if "foreign key constraint fails" in str(err).lower() — criar uma exception customizada ForeignKeyConstraintError e lançá-la ali em vez de raise genérico facilitará o tratamento no handler.
+
+Ajuste ps testes unitarios tbm 
